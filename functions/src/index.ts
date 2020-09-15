@@ -18,29 +18,54 @@ const firebase = require('firebase');
 // Initialize Firebase
 firebase.initializeApp(config);
 
-
-// forma de hacer un endpont con Firebase
-// export const getScreams = functions.https.onRequest((req, res) => {
-//     admin.firestore().collection('screams').get()
-//         .then((data: any[]) => {
-//             let screams: any[] = [];
-
-//             data.forEach(element => {
-//                 screams.push(element.data());
-//             });
-//             return res.json(screams);
-//         })
-//         .catch((err: any) => console.log(err))
-// })
-
 // get db
 const db = admin.firestore();
+
+/* 
+    handle token 
+    para que funcione debe coincidir el uid del usuario en Athentication (web de firebase)
+    con el uid del usuario registrado en Cloud Firestore --> users 
+*/
+const faAuth = (req: any, res: any, next: any) => {
+    let idToken;
+    if (
+        req.headers.authorization &&
+        req.headers.authorization.startsWith('Bearer ')
+    ) {
+        idToken = req.headers.authorization.split('Bearer ')[1];
+    } else {
+        // No token found
+        return res.status(403).json({ error: 'Unauthorized' });
+    }
+
+    admin
+        .auth()
+        .verifyIdToken(idToken)
+        .then((decodedToken: any) => {
+            //res.status(200).json(decodedToken );
+            req.user = decodedToken;
+            return db
+                .collection('users')
+                .where('userId', '==', decodedToken.uid)
+                .limit(1)
+                .get();
+        })
+        .then((data: any) => {
+            req.user.handle = data.docs[0].data().handle;
+            req.user.imageUrl = data.docs[0].data().imageUrl;
+            return next();
+        })
+        .catch((err: any) => {
+            // Error while verifying token 
+            return res.status(403).json(err);
+        });
+};
 
 // forma de hacer un endpoint con Express
 app.get('/screams', (req: any, res: any) => {
     db
         .collection('screams')
-        .orderBy('createdAt', 'desc')
+        .orderBy('createdAt', 'desc') // para que el orderBy funcione hay que declararlo en Firestore -> indices
         .get()
         .then((data: any[]) => {
             let screams: any[] = [];
@@ -57,20 +82,31 @@ app.get('/screams', (req: any, res: any) => {
         .catch((err: any) => console.log(err))
 })
 
-app.post('/scream', (req: any, res: any) => {
-    const newScream = {
-        body: req.body.body,
-        userHandle: req.body.userHandle,
-        createdAt: new Date().toISOString()
+// post one screa,
+app.post('/scream', faAuth, (req: any, res: any) => {
+    if (req.body.body.trim() === '') {
+        return res.status(400).json({ body: 'Body must not be empty' });
     }
 
-    db
-        .collection('screams')
+    const newScream = {
+        body: req.body.body,
+        userHandle: req.user.handle, // este viene de faAuth
+        userImage: req.user.imageUrl,
+        createdAt: new Date().toISOString(),
+        likeCount: 0,
+        commentCount: 0
+    };
+
+    db.collection('screams')
         .add(newScream)
         .then((doc: any) => {
-            res.json({ message: `document ${doc.id} created successfully` })
+            const resScream: any = newScream;
+            resScream.screamId = doc.id;
+            res.json(resScream);
         })
-        .catch((err: any) => res.status(500).json({ error: 'something went wrong' }))
+        .catch((err: any) => {
+            res.status(500).json({ error: 'something went wrong' });
+        });
 })
 
 // valida si el campo esta vacio
@@ -117,6 +153,9 @@ app.post('/signup', (req: any, res: any) => {
     if (Object.keys(errors).length > 0)
         return res.status(400).json(errors);
 
+    // img
+    const noImg = 'no-img.png';
+
     // validate
     db.doc(`/users/ ${newUser.handle}`).get()
         .then((doc: any) => {
@@ -136,6 +175,7 @@ app.post('/signup', (req: any, res: any) => {
                 handle: newUser.handle,
                 email: newUser.email,
                 createdAt: new Date().toISOString(),
+                imageUrl: `https://firebasestorage.googleapis.com/v0/b/${config.storageBucket}/o/${noImg}?alt=media`,
                 userId: userId
             }
             return db.doc(`/users/${newUser.handle}`).set(userCredentials);
@@ -168,25 +208,409 @@ app.post('/login', (req: any, res: any) => {
     if (Object.keys(errors).length > 0)
         return res.status(400).json(errors);
 
-        firebase
+    firebase
         .auth()
         .signInWithEmailAndPassword(user.email, user.password)
-        .then((data:any) => {
-          return data.user.getIdToken();
+        .then((data: any) => {
+            return data.user.getIdToken();
         })
-        .then((token:any) => {
-          return res.json({ token });
+        .then((token: any) => {
+            return res.json({ token });
         })
-        .catch((err:any) => {
-          console.error(err);
-          // auth/wrong-password
-          // auth/user-not-user
-          return res
-            .status(403)
-            .json({ general: "Wrong credentials, please try again" });
+        .catch((err: any) => {
+            // auth/wrong-password
+            // auth/user-not-user
+            return res
+                .status(403)
+                .json({ general: "Wrong credentials, please try again" });
         });
 })
 
+/* upload img user
+    install "npm i --save busboy" A node.js module for parsing incoming HTML form data.
+    https://www.npmjs.com/package/busboy
+*/
+// Upload a profile image for user
+app.post('/user/img', faAuth, (req: any, res: any) => {
+    const BusBoy = require("busboy");
+    const path = require("path");
+    const os = require("os");
+    const fs = require("fs");
 
+    const busboy = new BusBoy({ headers: req.headers });
+
+    let imageToBeUploaded: any = {};
+    let imageFileName: any;
+    // String for image token
+    //let generatedToken = uuid();
+
+    busboy.on("file", (fieldname: any, file: any, filename: any, encoding: any, mimetype: any) => {
+
+        // fieldname, file, filename, encoding, mimetype
+        if (mimetype !== "image/jpeg" && mimetype !== "image/png") {
+            return res.status(400).json({ error: "Wrong file type submitted" });
+        }
+        // my.image.png => ['my', 'image', 'png']
+        const imageExtension = filename.split(".")[filename.split(".").length - 1];
+        // 32756238461724837.png
+        imageFileName = `${Math.round(
+            Math.random() * 1000000000000
+        ).toString()}.${imageExtension}`;
+        const filepath = path.join(os.tmpdir(), imageFileName);
+        imageToBeUploaded = { filepath, mimetype };
+        file.pipe(fs.createWriteStream(filepath));
+    });
+    busboy.on("finish", () => {
+        admin
+            .storage()
+            .bucket()
+            .upload(imageToBeUploaded.filepath, {
+                resumable: false,
+                metadata: {
+                    metadata: {
+                        contentType: imageToBeUploaded.mimetype,
+                        //Generate token to be appended to imageUrl
+                        //firebaseStorageDownloadTokens: generatedToken,
+                    },
+                },
+            })
+            .then(() => {
+                // Append token to url
+                const imageUrl = `https://firebasestorage.googleapis.com/v0/b/${config.storageBucket}/o/${imageFileName}?alt=media`;
+                //const imageUrl = `https://firebasestorage.googleapis.com/v0/b/${config.storageBucket}/o/${imageFileName}?alt=media&token=${generatedToken}`;
+                return db.doc(`/users/${req.user.handle}`).update({ imageUrl });
+            })
+            .then(() => {
+                return res.json({ message: "image uploaded successfully" });
+            })
+            .catch((err: any) => {
+                return res.status(500).json({ error: "something went wrong" });
+            });
+    });
+    busboy.end(req.rawBody);
+});
+
+
+// get any user details
+app.get('/user', faAuth, (req: any, res: any) => {
+    let userData: any = {};
+    db.doc(`/users/${req.user.handle}`)
+        .get()
+        .then((doc: any) => {
+            if (doc.exists) {
+                userData.credentials = doc.data();
+                return db
+                    .collection("likes")
+                    .where("userHandle", "==", req.user.handle)
+                    .get();
+            }
+        })
+        .then((data: any) => {
+            userData.likes = [];
+            data.forEach((doc: any) => {
+                userData.likes.push(doc.data());
+            });
+            return db
+                .collection("notifications")
+                .where("recipient", "==", req.user.handle)
+                .orderBy("createdAt", "desc")
+                .limit(10)
+                .get();
+        })
+        .then((data: any) => {
+            userData.notifications = [];
+            data.forEach((doc: any) => {
+                userData.notifications.push({
+                    recipient: doc.data().recipient,
+                    sender: doc.data().sender,
+                    createdAt: doc.data().createdAt,
+                    screamId: doc.data().screamId,
+                    type: doc.data().type,
+                    read: doc.data().read,
+                    notificationId: doc.id,
+                });
+            });
+            return res.json(userData);
+        })
+        .catch((err: any) => {
+            console.error(err);
+            return res.status(500).json({ error: err.code });
+        });
+});
+// add detail user
+app.post('/user', faAuth, (req: any, res: any) => {
+    let userDetails = reduceUserDetails(req.body);
+
+    db.doc(`/users/${req.user.handle}`)
+        .update(userDetails)
+        .then(() => {
+            return res.json({ message: "Details added successfully" });
+        })
+        .catch((err: any) => {
+            return res.status(500).json({ error: err.code });
+        });
+});
+
+const reduceUserDetails = (data: any) => {
+    let userDetails: any = {};
+
+    if (!isEmpty(data.bio.trim())) userDetails.bio = data.bio;
+    if (!isEmpty(data.website.trim())) {
+
+        // https://website.com
+        if (data.website.trim().substring(0, 4) !== 'http') {
+            userDetails.website = `http://${data.website.trim()}`;
+        } else userDetails.website = data.website;
+    }
+    if (!isEmpty(data.location.trim())) userDetails.location = data.location;
+
+    return userDetails;
+};
+
+// Fetch one scream
+app.get('/scream/:screamId', (req: any, res: any) => {
+    let screamData: any = {};
+    db.doc(`/screams/${req.params.screamId}`)
+        .get()
+        .then((doc: any) => {
+            if (!doc.exists) {
+                return res.status(404).json({ error: 'Scream not found' });
+            }
+            screamData = doc.data();
+            screamData.screamId = doc.id;
+            return db
+                .collection('comments')
+                .orderBy('createdAt', 'desc')
+                .where('screamId', '==', req.params.screamId)
+                .get();
+        })
+        .then((data: any) => {
+            screamData.comments = [];
+            data.forEach((doc: any) => {
+                screamData.comments.push(doc.data());
+            });
+            return res.json(screamData);
+        })
+        .catch((err: any) => {
+            console.error(err);
+            res.status(500).json({ error: err.code });
+        });
+});
+
+// Comment on a scream
+app.post('/scream/:screamId/comment', faAuth, (req: any, res: any) => {
+    if (req.body.body.trim() === '')
+        return res.status(400).json({ comment: 'Must not be empty' });
+
+    const newComment = {
+        body: req.body.body,
+        createdAt: new Date().toISOString(),
+        screamId: req.params.screamId,
+        userHandle: req.user.handle,
+        userImage: req.user.imageUrl
+    };
+    console.log(newComment);
+
+    db.doc(`/screams/${req.params.screamId}`)
+        .get()
+        .then((doc: any) => {
+            if (!doc.exists) {
+                return res.status(404).json({ error: 'Scream not found' });
+            }
+            return doc.ref.update({ commentCount: doc.data().commentCount + 1 });
+        })
+        .then(() => {
+            return db.collection('comments').add(newComment);
+        })
+        .then(() => {
+            res.json(newComment);
+        })
+        .catch((err: any) => {
+            console.log(err);
+            res.status(500).json({ error: 'Something went wrong' });
+        });
+});
+
+// Like a scream
+app.get('/scream/:screamId/like', faAuth, (req: any, res: any) => {
+    const likeDocument = db
+        .collection('likes')
+        .where('userHandle', '==', req.user.handle)
+        .where('screamId', '==', req.params.screamId)
+        .limit(1);
+
+    const screamDocument = db.doc(`/screams/${req.params.screamId}`);
+
+    let screamData: any;
+
+    screamDocument
+        .get()
+        .then((doc: any) => {
+            if (doc.exists) {
+                screamData = doc.data();
+                screamData.screamId = doc.id;
+                return likeDocument.get();
+            } else {
+                return res.status(404).json({ error: 'Scream not found' });
+            }
+        })
+        .then((data: any) => {
+            if (data.empty) {
+                return db
+                    .collection('likes')
+                    .add({
+                        screamId: req.params.screamId,
+                        userHandle: req.user.handle
+                    })
+                    .then(() => {
+                        screamData.likeCount++;
+                        return screamDocument.update({ likeCount: screamData.likeCount });
+                    })
+                    .then(() => {
+                        return res.json(screamData);
+                    });
+            } else {
+                return res.status(400).json({ error: 'Scream already liked' });
+            }
+        })
+        .catch((err: any) => {
+            console.error(err);
+            res.status(500).json({ error: err.code });
+        });
+});
+
+// unlike scream
+app.get('/scream/:screamId/unlike', faAuth, (req: any, res: any) => {
+    const likeDocument = db
+        .collection('likes')
+        .where('userHandle', '==', req.user.handle)
+        .where('screamId', '==', req.params.screamId)
+        .limit(1);
+
+    const screamDocument = db.doc(`/screams/${req.params.screamId}`);
+
+    let screamData: any;
+
+    screamDocument
+        .get()
+        .then((doc: any) => {
+            if (doc.exists) {
+                screamData = doc.data();
+                screamData.screamId = doc.id;
+                return likeDocument.get();
+            } else {
+                return res.status(404).json({ error: 'Scream not found' });
+            }
+        })
+        .then((data: any) => {
+            if (data.empty) {
+                return res.status(400).json({ error: 'Scream not liked' });
+            } else {
+                return db
+                    .doc(`/likes/${data.docs[0].id}`)
+                    .delete()
+                    .then(() => {
+                        screamData.likeCount--;
+                        return screamDocument.update({ likeCount: screamData.likeCount });
+                    })
+                    .then(() => {
+                        res.json(screamData);
+                    });
+            }
+        })
+        .catch((err: any) => {
+            console.error(err);
+            res.status(500).json({ error: err.code });
+        });
+});
+
+// Delete a scream
+app.delete('/scream/:screamId', faAuth, (req: any, res: any) => {
+    const document = db.doc(`/screams/${req.params.screamId}`);
+    document
+      .get()
+      .then((doc: any) => {
+        if (!doc.exists) {
+          return res.status(404).json({ error: 'Scream not found' });
+        }
+        if (doc.data().userHandle !== req.user.handle) {
+          return res.status(403).json({ error: 'Unauthorized' });
+        } else {
+          return document.delete();
+        }
+      })
+      .then(() => {
+        res.json({ message: 'Scream deleted successfully' });
+      })
+      .catch((err: any) => {
+        console.error(err);
+        return res.status(500).json({ error: err.code });
+      });
+  });
 // URL base https://base.com/api/
 export const api = functions.https.onRequest(app);
+
+// Notifications
+exports.createNotificationOnLike = functions
+  .region('us-central1')
+  .firestore.document('likes/{id}')
+  .onCreate((snapshot) => {
+    return db
+      .doc(`/screams/${snapshot.data().screamId}`)
+      .get()
+      .then((doc: any) => {
+        if (
+          doc.exists &&
+          doc.data().userHandle !== snapshot.data().userHandle
+        ) {
+          return db.doc(`/notifications/${snapshot.id}`).set({
+            createdAt: new Date().toISOString(),
+            recipient: doc.data().userHandle,
+            sender: snapshot.data().userHandle,
+            type: 'like',
+            read: false,
+            screamId: doc.id
+          });
+        }
+      })
+      .catch((err: any) => console.error(err));
+  });
+exports.deleteNotificationOnUnLike = functions
+  .region('us-central1')
+  .firestore.document('likes/{id}')
+  .onDelete((snapshot) => {
+    return db
+      .doc(`/notifications/${snapshot.id}`)
+      .delete()
+      .catch((err: any) => {
+        console.error(err);
+        return;
+      });
+  });
+exports.createNotificationOnComment = functions
+  .region('us-central1')
+  .firestore.document('comments/{id}')
+  .onCreate((snapshot) => {
+    return db
+      .doc(`/screams/${snapshot.data().screamId}`)
+      .get()
+      .then((doc: any) => {
+        if (
+          doc.exists &&
+          doc.data().userHandle !== snapshot.data().userHandle
+        ) {
+          return db.doc(`/notifications/${snapshot.id}`).set({
+            createdAt: new Date().toISOString(),
+            recipient: doc.data().userHandle,
+            sender: snapshot.data().userHandle,
+            type: 'comment',
+            read: false,
+            screamId: doc.id
+          });
+        }
+      })
+      .catch((err: any) => {
+        console.error(err);
+        return;
+      });
+  });
