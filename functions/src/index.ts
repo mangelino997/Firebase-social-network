@@ -74,7 +74,10 @@ app.get('/screams', (req: any, res: any) => {
                     screamId: element.id,
                     body: element.data().body,
                     userHandle: element.data().userHandle,
-                    createdAt: element.data().createdAt
+                    createdAt: element.data().createdAt,
+                    commentCount: element.data().commentCount,
+                    likeCount: element.data().likeCount,
+                    userImage: element.data().userImage
                 });
             });
             return res.json(screams);
@@ -187,7 +190,7 @@ app.post('/signup', (req: any, res: any) => {
             if (err.code === 'auth/email-already-in-use')
                 return res.status(400).json({ email: "Email is already in use." })
             else
-                return res.status(500).json({ error: err.code })
+                return res.status(500).json({ general: "Something went wrong, please try again." })
         });
 });
 
@@ -291,7 +294,7 @@ app.post('/user/img', faAuth, (req: any, res: any) => {
 });
 
 
-// get any user details
+// get own user details
 app.get('/user', faAuth, (req: any, res: any) => {
     let userData: any = {};
     db.doc(`/users/${req.user.handle}`)
@@ -313,7 +316,7 @@ app.get('/user', faAuth, (req: any, res: any) => {
             return db
                 .collection("notifications")
                 .where("recipient", "==", req.user.handle)
-                .orderBy("createdAt", "desc")
+                .orderBy("createdAt", "desc") // se crea el indice en cloud firestore
                 .limit(10)
                 .get();
         })
@@ -337,6 +340,45 @@ app.get('/user', faAuth, (req: any, res: any) => {
             return res.status(500).json({ error: err.code });
         });
 });
+
+// Get any user's details
+app.get('/user/:handle', (req: any, res: any) => {
+    let userData: any = {};
+    db.doc(`/users/${req.params.handle}`)
+        .get()
+        .then((doc: any) => {
+            if (doc.exists) {
+                userData.user = doc.data();
+                return db
+                    .collection("screams")
+                    .where("userHandle", "==", req.params.handle)
+                    .orderBy("createdAt", "desc")
+                    .get();
+            } else {
+                return res.status(404).json({ errror: "User not found" });
+            }
+        })
+        .then((data: any) => {
+            userData.screams = [];
+            data.forEach((doc: any) => {
+                userData.screams.push({
+                    body: doc.data().body,
+                    createdAt: doc.data().createdAt,
+                    userHandle: doc.data().userHandle,
+                    userImage: doc.data().userImage,
+                    likeCount: doc.data().likeCount,
+                    commentCount: doc.data().commentCount,
+                    screamId: doc.id,
+                });
+            });
+            return res.json(userData);
+        })
+        .catch((err: any) => {
+            console.error(err);
+            return res.status(500).json({ error: err.code });
+        });
+});
+
 // add detail user
 app.post('/user', faAuth, (req: any, res: any) => {
     let userDetails = reduceUserDetails(req.body);
@@ -366,6 +408,23 @@ const reduceUserDetails = (data: any) => {
 
     return userDetails;
 };
+
+app.post('/notifications', faAuth, (req: any, res: any) => {
+    let batch = db.batch();
+    req.body.forEach((notificationId: any) => {
+        const notification = db.doc(`/notifications/${notificationId}`);
+        batch.update(notification, { read: true });
+    });
+    batch
+        .commit()
+        .then(() => {
+            return res.json({ message: "Notifications marked read" });
+        })
+        .catch((err: any) => {
+            console.error(err);
+            return res.status(500).json({ error: err.code });
+        });
+});
 
 // Fetch one scream
 app.get('/scream/:screamId', (req: any, res: any) => {
@@ -397,7 +456,7 @@ app.get('/scream/:screamId', (req: any, res: any) => {
         });
 });
 
-// Comment on a scream
+// Comment on a comment
 app.post('/scream/:screamId/comment', faAuth, (req: any, res: any) => {
     if (req.body.body.trim() === '')
         return res.status(400).json({ comment: 'Must not be empty' });
@@ -528,89 +587,148 @@ app.get('/scream/:screamId/unlike', faAuth, (req: any, res: any) => {
 app.delete('/scream/:screamId', faAuth, (req: any, res: any) => {
     const document = db.doc(`/screams/${req.params.screamId}`);
     document
-      .get()
-      .then((doc: any) => {
-        if (!doc.exists) {
-          return res.status(404).json({ error: 'Scream not found' });
-        }
-        if (doc.data().userHandle !== req.user.handle) {
-          return res.status(403).json({ error: 'Unauthorized' });
-        } else {
-          return document.delete();
-        }
-      })
-      .then(() => {
-        res.json({ message: 'Scream deleted successfully' });
-      })
-      .catch((err: any) => {
-        console.error(err);
-        return res.status(500).json({ error: err.code });
-      });
-  });
+        .get()
+        .then((doc: any) => {
+            if (!doc.exists) {
+                return res.status(404).json({ error: 'Scream not found' });
+            }
+            if (doc.data().userHandle !== req.user.handle) {
+                return res.status(403).json({ error: 'Unauthorized' });
+            } else {
+                return document.delete();
+            }
+        })
+        .then(() => {
+            res.json({ message: 'Scream deleted successfully' });
+        })
+        .catch((err: any) => {
+            console.error(err);
+            return res.status(500).json({ error: err.code });
+        });
+});
 // URL base https://base.com/api/
 export const api = functions.https.onRequest(app);
 
 // Notifications
 exports.createNotificationOnLike = functions
-  .region('us-central1')
-  .firestore.document('likes/{id}')
-  .onCreate((snapshot) => {
-    return db
-      .doc(`/screams/${snapshot.data().screamId}`)
-      .get()
-      .then((doc: any) => {
-        if (
-          doc.exists &&
-          doc.data().userHandle !== snapshot.data().userHandle
-        ) {
-          return db.doc(`/notifications/${snapshot.id}`).set({
-            createdAt: new Date().toISOString(),
-            recipient: doc.data().userHandle,
-            sender: snapshot.data().userHandle,
-            type: 'like',
-            read: false,
-            screamId: doc.id
-          });
-        }
-      })
-      .catch((err: any) => console.error(err));
-  });
+    .region('us-central1')
+    .firestore.document('likes/{id}')
+    .onCreate((snapshot) => {
+        return db
+            .doc(`/screams/${snapshot.data().screamId}`)
+            .get()
+            .then((doc: any) => {
+                if (
+                    doc.exists &&
+                    doc.data().userHandle !== snapshot.data().userHandle
+                ) {
+                    return db.doc(`/notifications/${snapshot.id}`).set({
+                        createdAt: new Date().toISOString(),
+                        recipient: doc.data().userHandle,
+                        sender: snapshot.data().userHandle,
+                        type: 'like',
+                        read: false,
+                        screamId: doc.id
+                    });
+                }
+            })
+            .catch((err: any) => console.error(err));
+    });
 exports.deleteNotificationOnUnLike = functions
-  .region('us-central1')
-  .firestore.document('likes/{id}')
-  .onDelete((snapshot) => {
-    return db
-      .doc(`/notifications/${snapshot.id}`)
-      .delete()
-      .catch((err: any) => {
-        console.error(err);
-        return;
-      });
-  });
+    .region('us-central1')
+    .firestore.document('likes/{id}')
+    .onDelete((snapshot) => {
+        return db
+            .doc(`/notifications/${snapshot.id}`)
+            .delete()
+            .catch((err: any) => {
+                console.error(err);
+                return;
+            });
+    });
 exports.createNotificationOnComment = functions
-  .region('us-central1')
-  .firestore.document('comments/{id}')
-  .onCreate((snapshot) => {
-    return db
-      .doc(`/screams/${snapshot.data().screamId}`)
-      .get()
-      .then((doc: any) => {
-        if (
-          doc.exists &&
-          doc.data().userHandle !== snapshot.data().userHandle
-        ) {
-          return db.doc(`/notifications/${snapshot.id}`).set({
-            createdAt: new Date().toISOString(),
-            recipient: doc.data().userHandle,
-            sender: snapshot.data().userHandle,
-            type: 'comment',
-            read: false,
-            screamId: doc.id
-          });
-        }
-      })
-      .catch((err: any) => {
-        console.error(err);
-        return;
-      });
-  });
+    .region('us-central1')
+    .firestore.document('comments/{id}')
+    .onCreate((snapshot) => {
+        return db
+            .doc(`/screams/${snapshot.data().screamId}`)
+            .get()
+            .then((doc: any) => {
+                if (
+                    doc.exists &&
+                    doc.data().userHandle !== snapshot.data().userHandle
+                ) {
+                    return db.doc(`/notifications/${snapshot.id}`).set({
+                        createdAt: new Date().toISOString(),
+                        recipient: doc.data().userHandle,
+                        sender: snapshot.data().userHandle,
+                        type: 'comment',
+                        read: false,
+                        screamId: doc.id
+                    });
+                }
+            })
+            .catch((err: any) => {
+                console.error(err);
+                return;
+            });
+    });
+
+// handle change image for user
+exports.onUserImageChange = functions
+    .region('us-central1')
+    .firestore.document('/users/{userId}')
+    .onUpdate((change) => {
+        if (change.before.data().imageUrl !== change.after.data().imageUrl) {
+            const batch = db.batch();
+            return db
+                .collection('screams')
+                .where('userHandle', '==', change.before.data().handle)
+                .get()
+                .then((data: any) => {
+                    data.forEach((doc: any) => {
+                        const scream = db.doc(`/screams/${doc.id}`);
+                        batch.update(scream, { userImage: change.after.data().imageUrl });
+                    });
+                    return batch.commit();
+                });
+        } else return true;
+    });
+
+// handle trigger for delete posts / screams
+exports.onScreamDelete = functions
+    .region('us-central1')
+    .firestore.document('/screams/{screamId}')
+    .onDelete((snapshot, context) => {
+        const screamId = context.params.screamId;
+        const batch = db.batch();
+        return db
+            .collection('comments')
+            .where('screamId', '==', screamId)
+            .get()
+            .then((data: any) => {
+                data.forEach((doc: any) => {
+                    batch.delete(db.doc(`/comments/${doc.id}`));
+                });
+                return db
+                    .collection('likes')
+                    .where('screamId', '==', screamId)
+                    .get();
+            })
+            .then((data: any) => {
+                data.forEach((doc: any) => {
+                    batch.delete(db.doc(`/likes/${doc.id}`));
+                });
+                return db
+                    .collection('notifications')
+                    .where('screamId', '==', screamId)
+                    .get();
+            })
+            .then((data: any) => {
+                data.forEach((doc: any) => {
+                    batch.delete(db.doc(`/notifications/${doc.id}`));
+                });
+                return batch.commit();
+            })
+            .catch((err: any) => console.error(err));
+    });
